@@ -1,10 +1,17 @@
+import hashlib
+import hmac
 import json
+import os
+import re
+import secrets
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime, timedelta
 from pathlib import Path
 
 DATA_FILE = Path(__file__).with_name("tasks.json")
+USERS_FILE = Path(__file__).with_name("users.json")
 DT_FMT = "%Y-%m-%d %H:%M"
 
 PRIORITIES = {"Високий": 0, "Середній": 1, "Низький": 2}
@@ -18,8 +25,28 @@ REMINDERS = {
 }
 REMINDER_BY_VALUE = {v: k for k, v in REMINDERS.items()}
 
+# ---------------------------------------------------------------- параметри автентифікації
+USERNAME_RE = re.compile(r"[\w.\-]{3,32}")   # літери, цифри, _ - .
+PASSWORD_MIN, PASSWORD_MAX = 8, 128
+MAX_FAILED = 5            # невдалих спроб до блокування
+LOCK_SECONDS = 60         # тривалість блокування
+IDLE_SECONDS = 15 * 60    # автовихід для облікових записів із паролем
+SCRYPT = {"n": 2 ** 14, "r": 8, "p": 1}
+SCRYPT_MAXMEM = 64 * 1024 * 1024
+
 
 # ---------------------------------------------------------------- сховище
+def write_json_atomic(path, data):
+    """Атомарний запис: тимчасовий файл + заміна; права 0600, де ОС це підтримує."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+
+
 def load_tasks():
     if DATA_FILE.exists():
         try:
@@ -30,19 +57,285 @@ def load_tasks():
 
 
 def save_tasks(tasks):
-    DATA_FILE.write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json_atomic(DATA_FILE, tasks)
+
+
+# ---------------------------------------------------------------- ідентифікація та автентифікація
+class AuthError(Exception):
+    """Помилка, текст якої безпечно показувати користувачу."""
+
+
+class AuthFileError(Exception):
+    """users.json пошкоджено або недоступний (програма не запускається: fail-closed)."""
+
+
+class AuthService:
+    """Користувачі: ідентифікація за іменем, необов'язковий пароль (scrypt + сіль)."""
+
+    def __init__(self, path):
+        self.path = path
+        self.users = self._load()
+
+    def _load(self):
+        if not self.path.exists():
+            return []
+        try:
+            users = json.loads(self.path.read_text(encoding="utf-8"))["users"]
+            if not isinstance(users, list) or not all(
+                    isinstance(u, dict) and isinstance(u["id"], str) and isinstance(u["username"], str)
+                    for u in users):
+                raise ValueError
+            return users
+        except (OSError, ValueError, KeyError, TypeError):
+            raise AuthFileError(
+                f"Файл {self.path.name} пошкоджено або недоступний.\n"
+                "Відновіть його з резервної копії або перемістіть вручну, щоб створити нових користувачів.")
+
+    def _save(self):
+        write_json_atomic(self.path, {"version": 1, "users": self.users})
+
+    # -- допоміжні
+    def usernames(self):
+        return sorted((u["username"] for u in self.users), key=str.casefold)
+
+    def find(self, username):
+        key = (username or "").strip().casefold()
+        return next((u for u in self.users if u["username"].casefold() == key), None)
+
+    def has_password(self, username):
+        user = self.find(username)
+        return bool(user and user.get("password"))
+
+    @staticmethod
+    def _info(user):
+        return {"id": user["id"], "username": user["username"]}
+
+    @staticmethod
+    def _make_hash(password):
+        if not PASSWORD_MIN <= len(password) <= PASSWORD_MAX:
+            raise AuthError(f"Пароль: від {PASSWORD_MIN} до {PASSWORD_MAX} символів.")
+        salt = secrets.token_bytes(16)
+        digest = hashlib.scrypt(password.encode("utf-8"), salt=salt, dklen=32,
+                                maxmem=SCRYPT_MAXMEM, **SCRYPT)
+        return {"alg": "scrypt", **SCRYPT, "salt": salt.hex(), "hash": digest.hex()}
+
+    @staticmethod
+    def _verify(password, rec):
+        try:
+            salt, expected = bytes.fromhex(rec["salt"]), bytes.fromhex(rec["hash"])
+            actual = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=rec["n"], r=rec["r"],
+                                    p=rec["p"], dklen=len(expected), maxmem=SCRYPT_MAXMEM)
+        except (KeyError, ValueError, TypeError, MemoryError):
+            return False
+        return hmac.compare_digest(actual, expected)
+
+    # -- сценарії
+    def register(self, username, password=""):
+        username = (username or "").strip()
+        if not USERNAME_RE.fullmatch(username):
+            raise AuthError("Ім'я: 3–32 символи — літери, цифри, «_», «-», «.».")
+        if self.find(username):
+            raise AuthError("Користувач із таким іменем уже існує.")
+        record = {
+            "id": secrets.token_hex(8),   # випадковий: не використовується повторно
+            "username": username,
+            "created": datetime.now().strftime(DT_FMT),
+            "password": self._make_hash(password) if password else None,
+            "failed": 0,
+            "locked_until": 0,
+        }
+        self.users.append(record)
+        self._save()
+        return self._info(record)
+
+    def login(self, username, password=""):
+        user = self.find(username)
+        if user is None:
+            raise AuthError("Виберіть користувача зі списку.")
+        rec = user.get("password")
+        if not rec:                       # пароль не задано — достатньо вибору імені
+            return self._info(user)
+
+        now = time.time()
+        if user.get("locked_until", 0) > now:
+            raise AuthError(f"Забагато невдалих спроб. Спробуйте через {int(user['locked_until'] - now) + 1} с.")
+
+        if self._verify(password or "", rec):
+            if user.get("failed") or user.get("locked_until"):
+                user["failed"], user["locked_until"] = 0, 0
+                self._save()
+            return self._info(user)
+
+        user["failed"] = user.get("failed", 0) + 1
+        if user["failed"] >= MAX_FAILED:
+            user["failed"], user["locked_until"] = 0, now + LOCK_SECONDS
+        self._save()
+        raise AuthError("Невірний пароль.")
+
+    def change_password(self, username, current, new):
+        """Задати, змінити (new непорожній) або прибрати (new порожній) пароль."""
+        user = self.find(username)
+        if user is None:
+            raise AuthError("Користувача не знайдено.")
+        if user.get("password"):
+            self.login(username, current)          # перевірка поточного пароля + блокування
+        user["password"] = self._make_hash(new) if new else None
+        user["failed"], user["locked_until"] = 0, 0
+        self._save()
+
+
+# ---------------------------------------------------------------- екрани входу
+class AuthScreen(ttk.Frame):
+    """Вибір імені користувача (+ пароль, якщо задано) або створення нового користувача."""
+
+    def __init__(self, master, auth, on_success, notice=""):
+        super().__init__(master, padding=20)
+        self.auth, self.on_success, self.notice = auth, on_success, notice
+        self.name_var = tk.StringVar()
+        self.pw_var = tk.StringVar()
+        self.pw2_var = tk.StringVar()
+        self.pack(expand=True)
+        self._show_login() if auth.usernames() else self._show_register()
+
+    def _reset(self, title):
+        for w in self.winfo_children():
+            w.destroy()
+        self.pw_var.set("")
+        self.pw2_var.set("")
+        ttk.Label(self, text=title, font=("TkDefaultFont", 14, "bold")).grid(
+            row=0, column=0, columnspan=2, pady=(0, 10))
+        if self.notice:
+            ttk.Label(self, text=self.notice, foreground="#c62828").grid(row=1, column=0, columnspan=2, pady=(0, 8))
+
+    # -- вхід
+    def _show_login(self):
+        self._reset("Вхід")
+        names = self.auth.usernames()
+        self.name_var.set(names[0])
+        ttk.Label(self, text="Користувач:").grid(row=2, column=0, sticky="w", pady=4)
+        combo = ttk.Combobox(self, textvariable=self.name_var, values=names, state="readonly", width=28)
+        combo.grid(row=2, column=1, pady=4)
+        combo.bind("<<ComboboxSelected>>", lambda e: self._sync_password_field())
+
+        ttk.Label(self, text="Пароль:").grid(row=3, column=0, sticky="w", pady=4)
+        self.pw_entry = ttk.Entry(self, textvariable=self.pw_var, show="•", width=30)
+        self.pw_entry.grid(row=3, column=1, pady=4)
+        self.pw_entry.bind("<Return>", lambda e: self._login())
+
+        btns = ttk.Frame(self)
+        btns.grid(row=4, column=0, columnspan=2, pady=(12, 0))
+        ttk.Button(btns, text="Увійти", command=self._login).pack(side="left", padx=5)
+        ttk.Button(btns, text="Новий користувач", command=self._show_register).pack(side="left", padx=5)
+        self._sync_password_field()
+
+    def _sync_password_field(self):
+        self.pw_var.set("")
+        if self.auth.has_password(self.name_var.get()):
+            self.pw_entry.state(["!disabled"])
+            self.pw_entry.focus_set()
+        else:
+            self.pw_entry.state(["disabled"])
+
+    def _login(self):
+        try:
+            user = self.auth.login(self.name_var.get(), self.pw_var.get())
+        except AuthError as e:
+            self.pw_var.set("")
+            messagebox.showerror("Вхід", str(e))
+            return
+        self.on_success(user, False)
+
+    # -- реєстрація
+    def _show_register(self):
+        self.notice = ""
+        self._reset("Новий користувач")
+        self.name_var.set("")
+        ttk.Label(self, text="Ім'я:").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Entry(self, textvariable=self.name_var, width=30).grid(row=2, column=1, pady=4)
+        ttk.Label(self, text="Пароль:").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Entry(self, textvariable=self.pw_var, show="•", width=30).grid(row=3, column=1, pady=4)
+        ttk.Label(self, text="Повтор пароля:").grid(row=4, column=0, sticky="w", pady=4)
+        ttk.Entry(self, textvariable=self.pw2_var, show="•", width=30).grid(row=4, column=1, pady=4)
+        ttk.Label(self, text=f"Пароль необов'язковий (мін. {PASSWORD_MIN} символів). "
+                             "Без пароля вхід лише за іменем.",
+                  foreground="#666666", wraplength=340).grid(row=5, column=0, columnspan=2, pady=4)
+
+        btns = ttk.Frame(self)
+        btns.grid(row=6, column=0, columnspan=2, pady=(8, 0))
+        ttk.Button(btns, text="Створити", command=self._register).pack(side="left", padx=5)
+        if self.auth.usernames():
+            ttk.Button(btns, text="Назад", command=self._show_login).pack(side="left", padx=5)
+
+    def _register(self):
+        if self.pw_var.get() != self.pw2_var.get():
+            messagebox.showerror("Реєстрація", "Паролі не збігаються.")
+            return
+        first = not self.auth.usernames()
+        try:
+            user = self.auth.register(self.name_var.get(), self.pw_var.get())
+        except AuthError as e:
+            messagebox.showerror("Реєстрація", str(e))
+            return
+        self.on_success(user, first)
+
+
+class PasswordDialog(tk.Toplevel):
+    """Задати / змінити / прибрати пароль поточного користувача."""
+
+    def __init__(self, parent, auth, username):
+        super().__init__(parent)
+        self.auth, self.username = auth, username
+        self.has_password = auth.has_password(username)
+        self.title("Пароль")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.cur_var, self.new_var, self.rep_var = tk.StringVar(), tk.StringVar(), tk.StringVar()
+
+        frm = ttk.Frame(self, padding=15)
+        frm.pack()
+        row = 0
+        fields = [("Новий пароль:", self.new_var), ("Повтор:", self.rep_var)]
+        if self.has_password:
+            fields.insert(0, ("Поточний пароль:", self.cur_var))
+        for label, var in fields:
+            ttk.Label(frm, text=label).grid(row=row, column=0, sticky="w", pady=4)
+            ttk.Entry(frm, textvariable=var, show="•", width=28).grid(row=row, column=1, pady=4, padx=(8, 0))
+            row += 1
+        hint = ("Порожній новий пароль прибирає пароль." if self.has_password
+                else f"Мінімум {PASSWORD_MIN} символів.")
+        ttk.Label(frm, text=hint, foreground="#666666").grid(row=row, column=0, columnspan=2, pady=4)
+        btns = ttk.Frame(frm)
+        btns.grid(row=row + 1, column=0, columnspan=2, pady=(8, 0))
+        ttk.Button(btns, text="Зберегти", command=self._save).pack(side="left", padx=5)
+        ttk.Button(btns, text="Скасувати", command=self.destroy).pack(side="left", padx=5)
+        self.grab_set()
+        self.wait_window()
+
+    def _save(self):
+        if self.new_var.get() != self.rep_var.get():
+            messagebox.showerror("Пароль", "Паролі не збігаються.", parent=self)
+            return
+        try:
+            self.auth.change_password(self.username, self.cur_var.get(), self.new_var.get())
+        except AuthError as e:
+            messagebox.showerror("Пароль", str(e), parent=self)
+            return
+        messagebox.showinfo("Пароль", "Збережено.", parent=self)
+        self.destroy()
 
 
 # ---------------------------------------------------------------- додаток
 class TodoApp:
-    def __init__(self, root):
+    def __init__(self, root, auth):
         self.root = root
+        self.auth = auth
         self.root.title("Планувальник справ")
-        self.root.geometry("900x560")
-        self.root.minsize(780, 480)
 
-        self.tasks = load_tasks()
+        self.all_tasks = load_tasks()
+        self.user = None            # сеанс: лише в пам'яті, на диск не записується
         self.editing_id = None
+        self._after_id = None
+        self._last_activity = time.monotonic()
 
         self.title_var = tk.StringVar()
         self.date_var = tk.StringVar()
@@ -52,13 +345,75 @@ class TodoApp:
         self.sort_var = tk.StringVar(value="deadline")
         self.show_done_var = tk.BooleanVar(value=True)
 
+        for seq in ("<Key>", "<Button>", "<Motion>"):
+            self.root.bind_all(seq, self._touch, add="+")
+        self.root.protocol("WM_DELETE_WINDOW", self.quit)
+        self.show_login()
+
+    @property
+    def tasks(self):
+        """Лише задачі поточного користувача."""
+        if self.user is None:
+            return []
+        return [t for t in self.all_tasks if t.get("owner") == self.user["id"]]
+
+    # ------------------------------------------------------------ сеанс
+    def _touch(self, _event=None):
+        self._last_activity = time.monotonic()
+
+    def _end_session(self):
+        if self._after_id is not None:
+            self.root.after_cancel(self._after_id)
+            self._after_id = None
+        self.user = None
+        self.editing_id = None
+
+    def show_login(self, notice=""):
+        self._end_session()
+        for w in self.root.winfo_children():
+            w.destroy()
+        self.root.geometry("420x340")
+        self.root.minsize(380, 300)
+        AuthScreen(self.root, self.auth, self._on_login, notice)
+
+    def _on_login(self, user, first_user):
+        self.user = user
+        if first_user:   # задачі з версії без користувачів дістаються першому створеному користувачу
+            orphans = [t for t in self.all_tasks if t.get("owner") is None]
+            for t in orphans:
+                t["owner"] = user["id"]
+            if orphans:
+                save_tasks(self.all_tasks)
+        for w in self.root.winfo_children():
+            w.destroy()
+        self.root.geometry("900x560")
+        self.root.minsize(780, 480)
+        self._touch()
         self._build_ui()
         self._reset_form()
         self.refresh()
         self.check_reminders()
 
+    def change_password(self):
+        PasswordDialog(self.root, self.auth, self.user["username"])
+        self._touch()
+
+    def quit(self):
+        self._end_session()
+        self.root.destroy()
+
+    def _idle_expired(self):
+        return (self.auth.has_password(self.user["username"])
+                and time.monotonic() - self._last_activity > IDLE_SECONDS)
+
     # ------------------------------------------------------------ інтерфейс
     def _build_ui(self):
+        top = ttk.Frame(self.root)
+        top.pack(fill="x", padx=10, pady=(8, 0))
+        ttk.Label(top, text=f"Користувач: {self.user['username']}").pack(side="left")
+        ttk.Button(top, text="Вийти", command=self.show_login).pack(side="right")
+        ttk.Button(top, text="Пароль…", command=self.change_password).pack(side="right", padx=5)
+
         form = ttk.LabelFrame(self.root, text="Завдання")
         form.pack(fill="x", padx=10, pady=(10, 5))
 
@@ -160,14 +515,15 @@ class TodoApp:
         }
 
         if self.editing_id is None:
-            data["id"] = max((t["id"] for t in self.tasks), default=0) + 1
+            data["id"] = max((t["id"] for t in self.all_tasks), default=0) + 1
+            data["owner"] = self.user["id"]
             data["done"] = False
-            self.tasks.append(data)
+            self.all_tasks.append(data)
         else:
             task = self._find(self.editing_id)
             task.update(data)
 
-        save_tasks(self.tasks)
+        save_tasks(self.all_tasks)
         self._reset_form()
         self.refresh()
 
@@ -186,7 +542,7 @@ class TodoApp:
         task = self._selected()
         if task:
             task["done"] = not task["done"]
-            save_tasks(self.tasks)
+            save_tasks(self.all_tasks)
             self.refresh()
 
     def start_edit(self):
@@ -206,8 +562,8 @@ class TodoApp:
     def delete(self):
         task = self._selected()
         if task and messagebox.askyesno("Видалення", f"Видалити «{task['title']}»?"):
-            self.tasks.remove(task)
-            save_tasks(self.tasks)
+            self.all_tasks.remove(task)
+            save_tasks(self.all_tasks)
             if self.editing_id == task["id"]:
                 self._reset_form()
             self.refresh()
@@ -216,8 +572,9 @@ class TodoApp:
     def refresh(self):
         self.tree.delete(*self.tree.get_children())
         now = datetime.now()
+        mine = self.tasks
 
-        tasks = [t for t in self.tasks if self.show_done_var.get() or not t["done"]]
+        tasks = [t for t in mine if self.show_done_var.get() or not t["done"]]
         if self.sort_var.get() == "priority":
             key = lambda t: (t["done"], PRIORITIES[t["priority"]], t["deadline"])
         else:
@@ -241,13 +598,18 @@ class TodoApp:
                 REMINDER_BY_VALUE.get(t["remind_minutes"], "—"),
             ))
 
-        active = sum(1 for t in self.tasks if not t["done"])
-        overdue = sum(1 for t in self.tasks
+        active = sum(1 for t in mine if not t["done"])
+        overdue = sum(1 for t in mine
                       if not t["done"] and datetime.strptime(t["deadline"], DT_FMT) < now)
-        self.status.config(text=f"Усього: {len(self.tasks)} | Активних: {active} | Прострочених: {overdue}")
+        self.status.config(text=f"Усього: {len(mine)} | Активних: {active} | Прострочених: {overdue}")
 
     # ------------------------------------------------------------ нагадування
     def check_reminders(self):
+        if self.user is None:
+            return
+        if self._idle_expired():
+            self.show_login("Сеанс завершено через неактивність.")
+            return
         now = datetime.now()
         fired = False
         for t in self.tasks:
@@ -267,12 +629,23 @@ class TodoApp:
                 messagebox.showinfo("Нагадування",
                                     f"{t['title']}\nДедлайн: {deadline.strftime('%d.%m.%Y %H:%M')}\n{when}")
         if fired:
-            save_tasks(self.tasks)
+            save_tasks(self.all_tasks)
         self.refresh()
-        self.root.after(15_000, self.check_reminders)  # перевірка кожні 15 секунд
+        self._after_id = self.root.after(15_000, self.check_reminders)  # перевірка кожні 15 секунд
+
+
+def main():
+    root = tk.Tk()
+    try:
+        auth = AuthService(USERS_FILE)
+    except AuthFileError as e:
+        root.withdraw()
+        messagebox.showerror("Помилка", str(e))
+        root.destroy()
+        return
+    TodoApp(root, auth)
+    root.mainloop()
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    TodoApp(root)
-    root.mainloop()
+    main()
