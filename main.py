@@ -10,6 +10,8 @@ from tkinter import ttk, messagebox
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from access_control import AccessDenied, Session, authorize, is_allowed
+
 DATA_FILE = Path(__file__).with_name("tasks.json")
 USERS_FILE = Path(__file__).with_name("users.json")
 DT_FMT = "%Y-%m-%d %H:%M"
@@ -60,6 +62,90 @@ def save_tasks(tasks):
     write_json_atomic(DATA_FILE, tasks)
 
 
+# ---------------------------------------------------------------- операції над задачами (з перевіркою прав)
+class TaskService:
+    """Єдина точка доступу до задач. Кожна операція викликає authorize() безпосередньо
+    перед виконанням; назовні віддаються лише копії, тож змінити дані в обхід
+    операцій неможливо. Поле owner задає лише сервіс (із сеансу), а не введення."""
+
+    def __init__(self, tasks, save=save_tasks):
+        self._tasks = tasks
+        self._save = save
+
+    @staticmethod
+    def _clean(data):
+        title = str(data.get("title", "")).strip()
+        if not title:
+            raise ValueError("Введіть назву завдання.")
+        try:
+            deadline = datetime.strptime(str(data.get("deadline", "")), DT_FMT)
+        except ValueError:
+            raise ValueError("Невірний формат дати або часу.")
+        priority = data.get("priority")
+        if not (isinstance(priority, str) and priority in PRIORITIES):
+            raise ValueError("Невірний пріоритет.")
+        remind = data.get("remind_minutes")
+        if remind not in REMINDERS.values():
+            raise ValueError("Невірне значення нагадування.")
+        return {"title": title, "deadline": deadline.strftime(DT_FMT),
+                "priority": priority, "remind_minutes": remind}
+
+    def _get(self, session, task_id, action):
+        task = next((t for t in self._tasks if isinstance(t, dict) and t.get("id") == task_id), None)
+        authorize(session, action, task)   # відсутня й чужа задачі невідрізнимі: існування не розкривається
+        return task
+
+    def list(self, session):
+        authorize(session, "task:list")
+        return [dict(t) for t in self._tasks if is_allowed(session, "task:read", t)]
+
+    def get(self, session, task_id):
+        return dict(self._get(session, task_id, "task:read"))
+
+    def create(self, session, data):
+        authorize(session, "task:create")
+        task = self._clean(data)
+        task.update(id=max((t.get("id", 0) for t in self._tasks if isinstance(t, dict)), default=0) + 1,
+                    owner=session.user_id, done=False, reminded=False)
+        self._tasks.append(task)
+        self._save(self._tasks)
+        return dict(task)
+
+    def update(self, session, task_id, data):
+        task = self._get(session, task_id, "task:update")
+        task.update(self._clean(data))
+        task["reminded"] = False
+        self._save(self._tasks)
+        return dict(task)
+
+    def toggle_done(self, session, task_id):
+        task = self._get(session, task_id, "task:toggle")
+        task["done"] = not task["done"]
+        self._save(self._tasks)
+        return dict(task)
+
+    def delete(self, session, task_id):
+        task = self._get(session, task_id, "task:delete")
+        self._tasks.remove(task)
+        self._save(self._tasks)
+
+    def mark_reminded(self, session, task_id):
+        task = self._get(session, task_id, "task:remind")
+        task["reminded"] = True
+        self._save(self._tasks)
+
+    def claim_legacy(self, session, first_user_id):
+        """Задачі старого формату (без owner) отримує лише перший створений профіль."""
+        claimed = 0
+        for t in self._tasks:
+            if is_allowed(session, "task:claim_legacy", t, first_user_id=first_user_id):
+                t["owner"] = session.user_id
+                claimed += 1
+        if claimed:
+            self._save(self._tasks)
+        return claimed
+
+
 # ---------------------------------------------------------------- ідентифікація та автентифікація
 class AuthError(Exception):
     """Помилка, текст якої безпечно показувати користувачу."""
@@ -107,8 +193,12 @@ class AuthService:
         return bool(user and user.get("password"))
 
     @staticmethod
-    def _info(user):
-        return {"id": user["id"], "username": user["username"]}
+    def _session(user):
+        limit = IDLE_SECONDS if user.get("password") else None
+        return Session(user["id"], user["username"], idle_limit=limit)
+
+    def first_user_id(self):
+        return self.users[0]["id"] if self.users else None
 
     @staticmethod
     def _make_hash(password):
@@ -130,7 +220,8 @@ class AuthService:
         return hmac.compare_digest(actual, expected)
 
     # -- сценарії
-    def register(self, username, password=""):
+    def register(self, username, password="", session=None):
+        authorize(session, "profile:register")
         username = (username or "").strip()
         if not USERNAME_RE.fullmatch(username):
             raise AuthError("Ім'я: 3–32 символи — літери, цифри, «_», «-», «.».")
@@ -146,16 +237,13 @@ class AuthService:
         }
         self.users.append(record)
         self._save()
-        return self._info(record)
+        return self._session(record)
 
-    def login(self, username, password=""):
-        user = self.find(username)
-        if user is None:
-            raise AuthError("Виберіть користувача зі списку.")
+    def _check_password(self, user, password):
+        """Перевірка пароля з лічильником спроб і блокуванням (без пароля — пропускає)."""
         rec = user.get("password")
-        if not rec:                       # пароль не задано — достатньо вибору імені
-            return self._info(user)
-
+        if not rec:
+            return
         now = time.time()
         if user.get("locked_until", 0) > now:
             raise AuthError(f"Забагато невдалих спроб. Спробуйте через {int(user['locked_until'] - now) + 1} с.")
@@ -164,7 +252,7 @@ class AuthService:
             if user.get("failed") or user.get("locked_until"):
                 user["failed"], user["locked_until"] = 0, 0
                 self._save()
-            return self._info(user)
+            return
 
         user["failed"] = user.get("failed", 0) + 1
         if user["failed"] >= MAX_FAILED:
@@ -172,16 +260,23 @@ class AuthService:
         self._save()
         raise AuthError("Невірний пароль.")
 
-    def change_password(self, username, current, new):
-        """Задати, змінити (new непорожній) або прибрати (new порожній) пароль."""
+    def login(self, username, password="", session=None):
+        authorize(session, "profile:login")
         user = self.find(username)
         if user is None:
-            raise AuthError("Користувача не знайдено.")
-        if user.get("password"):
-            self.login(username, current)          # перевірка поточного пароля + блокування
+            raise AuthError("Виберіть користувача зі списку.")
+        self._check_password(user, password)
+        return self._session(user)
+
+    def change_password(self, session, current, new):
+        """Задати, змінити (new непорожній) або прибрати (new порожній) пароль. Лише власник профілю."""
+        user = next((u for u in self.users if session is not None and u["id"] == session.user_id), None)
+        authorize(session, "profile:password", user)
+        self._check_password(user, current)        # перевірка поточного пароля + блокування
         user["password"] = self._make_hash(new) if new else None
         user["failed"], user["locked_until"] = 0, 0
         self._save()
+        session.idle_limit = IDLE_SECONDS if user["password"] else None
 
 
 # ---------------------------------------------------------------- екрани входу
@@ -282,10 +377,10 @@ class AuthScreen(ttk.Frame):
 class PasswordDialog(tk.Toplevel):
     """Задати / змінити / прибрати пароль поточного користувача."""
 
-    def __init__(self, parent, auth, username):
+    def __init__(self, parent, auth, session):
         super().__init__(parent)
-        self.auth, self.username = auth, username
-        self.has_password = auth.has_password(username)
+        self.auth, self.session = auth, session
+        self.has_password = auth.has_password(session.username)
         self.title("Пароль")
         self.resizable(False, False)
         self.transient(parent)
@@ -316,8 +411,8 @@ class PasswordDialog(tk.Toplevel):
             messagebox.showerror("Пароль", "Паролі не збігаються.", parent=self)
             return
         try:
-            self.auth.change_password(self.username, self.cur_var.get(), self.new_var.get())
-        except AuthError as e:
+            self.auth.change_password(self.session, self.cur_var.get(), self.new_var.get())
+        except (AuthError, AccessDenied) as e:
             messagebox.showerror("Пароль", str(e), parent=self)
             return
         messagebox.showinfo("Пароль", "Збережено.", parent=self)
@@ -331,11 +426,10 @@ class TodoApp:
         self.auth = auth
         self.root.title("Планувальник справ")
 
-        self.all_tasks = load_tasks()
-        self.user = None            # сеанс: лише в пам'яті, на диск не записується
+        self.service = TaskService(load_tasks())
+        self.session = None         # сеанс: лише в пам'яті, на диск не записується
         self.editing_id = None
         self._after_id = None
-        self._last_activity = time.monotonic()
 
         self.title_var = tk.StringVar()
         self.date_var = tk.StringVar()
@@ -350,23 +444,34 @@ class TodoApp:
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
         self.show_login()
 
-    @property
-    def tasks(self):
-        """Лише задачі поточного користувача."""
-        if self.user is None:
-            return []
-        return [t for t in self.all_tasks if t.get("owner") == self.user["id"]]
-
     # ------------------------------------------------------------ сеанс
     def _touch(self, _event=None):
-        self._last_activity = time.monotonic()
+        if self.session is not None:
+            self.session.touch()     # прострочений сеанс не відновлюється
 
     def _end_session(self):
         if self._after_id is not None:
             self.root.after_cancel(self._after_id)
             self._after_id = None
-        self.user = None
+        if self.session is not None:
+            self.session.end()
+        self.session = None
         self.editing_id = None
+
+    def _denied(self, err):
+        """Реакція на відмову: недійсний сеанс — екран входу, інакше повідомлення."""
+        if self.session is None or not self.session.active:
+            self.show_login(str(err))
+        else:
+            messagebox.showerror("Доступ", str(err))
+
+    def _call(self, op, *args):
+        """Виклик захищеної операції сервісу; повертає (успіх, результат)."""
+        try:
+            return True, op(self.session, *args)
+        except AccessDenied as e:
+            self._denied(e)
+            return False, None
 
     def show_login(self, notice=""):
         self._end_session()
@@ -376,14 +481,10 @@ class TodoApp:
         self.root.minsize(380, 300)
         AuthScreen(self.root, self.auth, self._on_login, notice)
 
-    def _on_login(self, user, first_user):
-        self.user = user
+    def _on_login(self, session, first_user):
+        self.session = session
         if first_user:   # задачі з версії без користувачів дістаються першому створеному користувачу
-            orphans = [t for t in self.all_tasks if t.get("owner") is None]
-            for t in orphans:
-                t["owner"] = user["id"]
-            if orphans:
-                save_tasks(self.all_tasks)
+            self.service.claim_legacy(session, self.auth.first_user_id())
         for w in self.root.winfo_children():
             w.destroy()
         self.root.geometry("900x560")
@@ -395,22 +496,18 @@ class TodoApp:
         self.check_reminders()
 
     def change_password(self):
-        PasswordDialog(self.root, self.auth, self.user["username"])
+        PasswordDialog(self.root, self.auth, self.session)
         self._touch()
 
     def quit(self):
         self._end_session()
         self.root.destroy()
 
-    def _idle_expired(self):
-        return (self.auth.has_password(self.user["username"])
-                and time.monotonic() - self._last_activity > IDLE_SECONDS)
-
     # ------------------------------------------------------------ інтерфейс
     def _build_ui(self):
         top = ttk.Frame(self.root)
         top.pack(fill="x", padx=10, pady=(8, 0))
-        ttk.Label(top, text=f"Користувач: {self.user['username']}").pack(side="left")
+        ttk.Label(top, text=f"Користувач: {self.session.username}").pack(side="left")
         ttk.Button(top, text="Вийти", command=self.show_login).pack(side="right")
         ttk.Button(top, text="Пароль…", command=self.change_password).pack(side="right", padx=5)
 
@@ -511,43 +608,40 @@ class TodoApp:
             "deadline": deadline.strftime(DT_FMT),
             "priority": self.priority_var.get(),
             "remind_minutes": REMINDERS[self.reminder_var.get()],
-            "reminded": False,
         }
 
-        if self.editing_id is None:
-            data["id"] = max((t["id"] for t in self.all_tasks), default=0) + 1
-            data["owner"] = self.user["id"]
-            data["done"] = False
-            self.all_tasks.append(data)
-        else:
-            task = self._find(self.editing_id)
-            task.update(data)
-
-        save_tasks(self.all_tasks)
+        try:
+            if self.editing_id is None:
+                ok, _ = self._call(self.service.create, data)
+            else:
+                ok, _ = self._call(self.service.update, self.editing_id, data)
+        except ValueError as e:
+            messagebox.showerror("Помилка", str(e))
+            return
+        if not ok:
+            return
         self._reset_form()
         self.refresh()
 
     # ------------------------------------------------------------ дії
-    def _find(self, task_id):
-        return next(t for t in self.tasks if t["id"] == task_id)
-
-    def _selected(self):
+    def _selected_id(self):
         sel = self.tree.selection()
         if not sel:
             messagebox.showinfo("Підказка", "Спочатку виберіть завдання у списку.")
             return None
-        return self._find(int(sel[0]))
+        return int(sel[0])
 
     def toggle_done(self):
-        task = self._selected()
-        if task:
-            task["done"] = not task["done"]
-            save_tasks(self.all_tasks)
+        task_id = self._selected_id()
+        if task_id is not None and self._call(self.service.toggle_done, task_id)[0]:
             self.refresh()
 
     def start_edit(self):
-        task = self._selected()
-        if not task:
+        task_id = self._selected_id()
+        if task_id is None:
+            return
+        ok, task = self._call(self.service.get, task_id)
+        if not ok:
             return
         dt = datetime.strptime(task["deadline"], DT_FMT)
         self.editing_id = task["id"]
@@ -560,11 +654,14 @@ class TodoApp:
         self.cancel_btn.state(["!disabled"])
 
     def delete(self):
-        task = self._selected()
-        if task and messagebox.askyesno("Видалення", f"Видалити «{task['title']}»?"):
-            self.all_tasks.remove(task)
-            save_tasks(self.all_tasks)
-            if self.editing_id == task["id"]:
+        task_id = self._selected_id()
+        if task_id is None:
+            return
+        ok, task = self._call(self.service.get, task_id)
+        if ok and messagebox.askyesno("Видалення", f"Видалити «{task['title']}»?"):
+            if not self._call(self.service.delete, task_id)[0]:   # права перевіряються ще раз перед видаленням
+                return
+            if self.editing_id == task_id:
                 self._reset_form()
             self.refresh()
 
@@ -572,7 +669,11 @@ class TodoApp:
     def refresh(self):
         self.tree.delete(*self.tree.get_children())
         now = datetime.now()
-        mine = self.tasks
+        try:
+            mine = self.service.list(self.session)
+        except AccessDenied as e:
+            self._denied(e)
+            return
 
         tasks = [t for t in mine if self.show_done_var.get() or not t["done"]]
         if self.sort_var.get() == "priority":
@@ -605,32 +706,34 @@ class TodoApp:
 
     # ------------------------------------------------------------ нагадування
     def check_reminders(self):
-        if self.user is None:
+        if self.session is None:
             return
-        if self._idle_expired():
+        if not self.session.active:
             self.show_login("Сеанс завершено через неактивність.")
             return
         now = datetime.now()
-        fired = False
-        for t in self.tasks:
-            if t["done"] or t.get("reminded") or t["remind_minutes"] is None:
-                continue
-            deadline = datetime.strptime(t["deadline"], DT_FMT)
-            if now >= deadline - timedelta(minutes=t["remind_minutes"]):
-                t["reminded"] = True
-                fired = True
-                self.root.bell()
-                left = deadline - now
-                if left.total_seconds() > 0:
-                    mins = int(left.total_seconds() // 60)
-                    when = f"Залишилось ≈ {mins // 60} год {mins % 60} хв"
-                else:
-                    when = "Дедлайн уже минув!"
-                messagebox.showinfo("Нагадування",
-                                    f"{t['title']}\nДедлайн: {deadline.strftime('%d.%m.%Y %H:%M')}\n{when}")
-        if fired:
-            save_tasks(self.all_tasks)
+        try:
+            for t in self.service.list(self.session):
+                if t["done"] or t.get("reminded") or t["remind_minutes"] is None:
+                    continue
+                deadline = datetime.strptime(t["deadline"], DT_FMT)
+                if now >= deadline - timedelta(minutes=t["remind_minutes"]):
+                    self.service.mark_reminded(self.session, t["id"])
+                    self.root.bell()
+                    left = deadline - now
+                    if left.total_seconds() > 0:
+                        mins = int(left.total_seconds() // 60)
+                        when = f"Залишилось ≈ {mins // 60} год {mins % 60} хв"
+                    else:
+                        when = "Дедлайн уже минув!"
+                    messagebox.showinfo("Нагадування",
+                                        f"{t['title']}\nДедлайн: {deadline.strftime('%d.%m.%Y %H:%M')}\n{when}")
+        except AccessDenied as e:
+            self._denied(e)
+            return
         self.refresh()
+        if self.session is None:
+            return
         self._after_id = self.root.after(15_000, self.check_reminders)  # перевірка кожні 15 секунд
 
 
