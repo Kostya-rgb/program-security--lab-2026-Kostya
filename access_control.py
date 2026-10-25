@@ -21,6 +21,7 @@ class Session:
         self._clock = clock
         self._ended = False
         self._last = clock()
+        self._keys = None                   # ключі шифрування: лише в пам'яті сеансу
 
     @property
     def active(self):
@@ -33,8 +34,19 @@ class Session:
         if self.active:
             self._last = self._clock()
 
+    def attach_keys(self, keys):
+        self._keys = keys
+
+    @property
+    def keys(self):
+        """Ключі доступні лише в активному сеансі."""
+        if not self.active or self._keys is None:
+            raise AccessDenied("Сеанс завершено. Увійдіть знову.")
+        return self._keys
+
     def end(self):
         self._ended = True
+        self._keys = None
 
 
 def _active(session):

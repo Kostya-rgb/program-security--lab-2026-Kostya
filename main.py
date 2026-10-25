@@ -4,6 +4,7 @@ import json
 import os
 import re
 import secrets
+import sys
 import time
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -11,9 +12,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from access_control import AccessDenied, Session, authorize, is_allowed
+from crypto_store import CryptoError, KeyManager, TaskVault, VaultError, write_json_private
 
 DATA_FILE = Path(__file__).with_name("tasks.json")
 USERS_FILE = Path(__file__).with_name("users.json")
+DEVICE_KEY_FILE = Path(__file__).with_name("device.key")
 DT_FMT = "%Y-%m-%d %H:%M"
 
 PRIORITIES = {"Високий": 0, "Середній": 1, "Низький": 2}
@@ -39,27 +42,8 @@ SCRYPT_MAXMEM = 64 * 1024 * 1024
 
 # ---------------------------------------------------------------- сховище
 def write_json_atomic(path, data):
-    """Атомарний запис: тимчасовий файл + заміна; права 0600, де ОС це підтримує."""
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    os.replace(tmp, path)
-
-
-def load_tasks():
-    if DATA_FILE.exists():
-        try:
-            return json.loads(DATA_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            messagebox.showwarning("Помилка", "Не вдалося прочитати tasks.json, починаємо з порожнього списку.")
-    return []
-
-
-def save_tasks(tasks):
-    write_json_atomic(DATA_FILE, tasks)
+    """Атомарний запис: тимчасовий файл (одразу з правами 0600) + заміна."""
+    write_json_private(path, data)
 
 
 # ---------------------------------------------------------------- операції над задачами (з перевіркою прав)
@@ -68,9 +52,9 @@ class TaskService:
     перед виконанням; назовні віддаються лише копії, тож змінити дані в обхід
     операцій неможливо. Поле owner задає лише сервіс (із сеансу), а не введення."""
 
-    def __init__(self, tasks, save=save_tasks):
+    def __init__(self, tasks, save=None):
         self._tasks = tasks
-        self._save = save
+        self._save = save or (lambda tasks: None)   # save: шифрує й записує задачі профілю
 
     @staticmethod
     def _clean(data):
@@ -158,8 +142,9 @@ class AuthFileError(Exception):
 class AuthService:
     """Користувачі: ідентифікація за іменем, необов'язковий пароль (scrypt + сіль)."""
 
-    def __init__(self, path):
+    def __init__(self, path, device_key_path=None):
         self.path = path
+        self.km = KeyManager(device_key_path or path.with_name("device.key"))
         self.users = self._load()
 
     def _load(self):
@@ -193,9 +178,22 @@ class AuthService:
         return bool(user and user.get("password"))
 
     @staticmethod
-    def _session(user):
+    def _session(user, keys):
         limit = IDLE_SECONDS if user.get("password") else None
-        return Session(user["id"], user["username"], idle_limit=limit)
+        session = Session(user["id"], user["username"], idle_limit=limit)
+        session.attach_keys(keys)
+        return session
+
+    def _unlock(self, user, password):
+        """Ключі профілю; для профілю зі старої версії (без ключів) створюються при першому вході."""
+        try:
+            if user.get("crypto") is None:
+                user["crypto"], keys = self.km.create(user["id"], password if user.get("password") else "")
+                self._save()
+                return keys
+            return self.km.unlock(user["id"], user["crypto"], password if user.get("password") else "")
+        except CryptoError as e:
+            raise AuthError(f"Ключі шифрування недоступні: {e}")
 
     def first_user_id(self):
         return self.users[0]["id"] if self.users else None
@@ -235,9 +233,13 @@ class AuthService:
             "failed": 0,
             "locked_until": 0,
         }
+        try:
+            record["crypto"], keys = self.km.create(record["id"], password)
+        except CryptoError as e:
+            raise AuthError(f"Не вдалося створити ключі шифрування: {e}")
         self.users.append(record)
         self._save()
-        return self._session(record)
+        return self._session(record, keys)
 
     def _check_password(self, user, password):
         """Перевірка пароля з лічильником спроб і блокуванням (без пароля — пропускає)."""
@@ -266,17 +268,53 @@ class AuthService:
         if user is None:
             raise AuthError("Виберіть користувача зі списку.")
         self._check_password(user, password)
-        return self._session(user)
+        return self._session(user, self._unlock(user, password))
 
     def change_password(self, session, current, new):
         """Задати, змінити (new непорожній) або прибрати (new порожній) пароль. Лише власник профілю."""
         user = next((u for u in self.users if session is not None and u["id"] == session.user_id), None)
         authorize(session, "profile:password", user)
         self._check_password(user, current)        # перевірка поточного пароля + блокування
-        user["password"] = self._make_hash(new) if new else None
+        new_hash = self._make_hash(new) if new else None
+        try:
+            # лише обгортка DEK під новий KEK (нова сіль); дані задач не перешифровуються
+            user["crypto"], keys = self.km.rewrap(user["id"], user["crypto"], session.keys, new)
+        except CryptoError as e:
+            raise AuthError(f"Не вдалося оновити ключі шифрування: {e}")
+        user["password"] = new_hash
         user["failed"], user["locked_until"] = 0, 0
         self._save()
+        session.attach_keys(keys)
         session.idle_limit = IDLE_SECONDS if user["password"] else None
+
+    # -- ротація ключів
+    def rotate_dek(self, session):
+        """Крок 1 ротації DEK: нова версія додається поруч зі старою. Повертає нові ключі."""
+        user = next((u for u in self.users if session is not None and u["id"] == session.user_id), None)
+        authorize(session, "profile:password", user)
+        user["crypto"], keys = self.km.add_version(user["id"], user["crypto"], session.keys)
+        self._save()
+        session.attach_keys(keys)
+        return keys
+
+    def finish_dek_rotation(self, session):
+        """Крок 3: після перешифрування даних стара версія DEK видаляється."""
+        user = next((u for u in self.users if session is not None and u["id"] == session.user_id), None)
+        authorize(session, "profile:password", user)
+        user["crypto"], keys = self.km.prune(user["id"], user["crypto"], session.keys)
+        self._save()
+        session.attach_keys(keys)
+
+    def dek_due(self, session):
+        user = next((u for u in self.users if u["id"] == session.user_id), None)
+        return bool(user and user.get("crypto") and self.km.dek_due(user["crypto"]))
+
+    def rotate_device_key(self):
+        """Ротація ключа пристрою (запуск без графічного інтерфейсу): профілі без пароля отримують
+        нові обгортки DEK; users.json зберігається до видалення старого ключа."""
+        used = self.km.rotate_device(self.users)
+        self._save()
+        self.km.device.retire(used)
 
 
 # ---------------------------------------------------------------- екрани входу
@@ -421,12 +459,13 @@ class PasswordDialog(tk.Toplevel):
 
 # ---------------------------------------------------------------- додаток
 class TodoApp:
-    def __init__(self, root, auth):
+    def __init__(self, root, auth, vault):
         self.root = root
         self.auth = auth
         self.root.title("Планувальник справ")
 
-        self.service = TaskService(load_tasks())
+        self.vault = vault
+        self.service = None         # створюється після входу, містить лише розшифровані задачі власника
         self.session = None         # сеанс: лише в пам'яті, на диск не записується
         self.editing_id = None
         self._after_id = None
@@ -456,6 +495,7 @@ class TodoApp:
         if self.session is not None:
             self.session.end()
         self.session = None
+        self.service = None         # розшифровані задачі видаляються з пам'яті
         self.editing_id = None
 
     def _denied(self, err):
@@ -483,8 +523,16 @@ class TodoApp:
 
     def _on_login(self, session, first_user):
         self.session = session
-        if first_user:   # задачі з версії без користувачів дістаються першому створеному користувачу
-            self.service.claim_legacy(session, self.auth.first_user_id())
+        try:
+            tasks = self._open_vault(session)
+        except (VaultError, AuthError) as e:
+            messagebox.showerror("Помилка", str(e))
+            self.show_login()
+            return
+        self.service = TaskService(tasks, save=lambda t: self.vault.save_user(session.user_id, session.keys, t))
+        # задачі з версії без користувачів дістаються першому створеному користувачу
+        self.service.claim_legacy(session, self.auth.first_user_id())
+        self._rotate_dek_if_due(session, tasks)
         for w in self.root.winfo_children():
             w.destroy()
         self.root.geometry("900x560")
@@ -494,6 +542,19 @@ class TodoApp:
         self._reset_form()
         self.refresh()
         self.check_reminders()
+
+    def _open_vault(self, session):
+        """Розшифрування задач одразу після входу."""
+        adopt = session.user_id == self.auth.first_user_id()
+        return self.vault.load_user(session.user_id, session.keys, adopt_orphans=adopt)
+
+    def _rotate_dek_if_due(self, session, tasks):
+        """Плановий строк життя DEK минув: нова версія -> перешифрування -> видалення старої."""
+        try:
+            if self.auth.dek_due(session):
+                rotate_dek(self.auth, self.vault, session, tasks)
+        except (CryptoError, AuthError, AccessDenied) as e:
+            messagebox.showwarning("Ключі", f"Ротацію ключа даних відкладено: {e}")
 
     def change_password(self):
         PasswordDialog(self.root, self.auth, self.session)
@@ -737,18 +798,36 @@ class TodoApp:
         self._after_id = self.root.after(15_000, self.check_reminders)  # перевірка кожні 15 секунд
 
 
+def rotate_dek(auth, vault, session, tasks):
+    """Ротація DEK профілю. Порядок захищає від втрати даних при збої між кроками:
+    1) нова версія ключа поруч зі старою (users.json); 2) перешифрування (tasks.json); 3) видалення старої."""
+    keys = auth.rotate_dek(session)
+    vault.save_user(session.user_id, keys, tasks)
+    auth.finish_dek_rotation(session)
+
+
 def main():
+    if "--rotate-device-key" in sys.argv:        # ротація ключа пристрою без GUI
+        try:
+            AuthService(USERS_FILE, DEVICE_KEY_FILE).rotate_device_key()
+        except (AuthFileError, CryptoError) as e:
+            print(f"Помилка: {e}")
+            return 1
+        print("Ключ пристрою замінено.")
+        return 0
     root = tk.Tk()
     try:
-        auth = AuthService(USERS_FILE)
-    except AuthFileError as e:
+        auth = AuthService(USERS_FILE, DEVICE_KEY_FILE)
+        vault = TaskVault(DATA_FILE)
+    except (AuthFileError, VaultError) as e:
         root.withdraw()
         messagebox.showerror("Помилка", str(e))
         root.destroy()
-        return
-    TodoApp(root, auth)
+        return 1
+    TodoApp(root, auth, vault)
     root.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
