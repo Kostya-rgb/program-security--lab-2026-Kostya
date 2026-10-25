@@ -12,11 +12,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from access_control import AccessDenied, Session, authorize, is_allowed
-from crypto_store import CryptoError, KeyManager, TaskVault, VaultError, write_json_private
+from crypto_store import (CryptoError, IntegrityError, KeyManager, TaskVault, VaultError,
+                          mac_check, mac_key, mac_tag, write_json_private)
+from integrity import IntegrityError as ReleaseError, verify_release
 
 DATA_FILE = Path(__file__).with_name("tasks.json")
 USERS_FILE = Path(__file__).with_name("users.json")
 DEVICE_KEY_FILE = Path(__file__).with_name("device.key")
+APP_DIR = Path(__file__).resolve().parent
 DT_FMT = "%Y-%m-%d %H:%M"
 
 PRIORITIES = {"Високий": 0, "Середній": 1, "Низький": 2}
@@ -145,25 +148,66 @@ class AuthService:
     def __init__(self, path, device_key_path=None):
         self.path = path
         self.km = KeyManager(device_key_path or path.with_name("device.key"))
+        self._migrate = False
         self.users = self._load()
+        if self._migrate:
+            self._save()
 
     def _load(self):
+        try:
+            required = self.km.device.mac_required()
+        except CryptoError as e:
+            raise AuthFileError(f"Файл ключів пошкоджено: {e}")
         if not self.path.exists():
+            if required:
+                raise AuthFileError(f"Файл {self.path.name} відсутній, хоча раніше існував "
+                                    "(порушення цілісності).\nВідновіть його з резервної копії.")
             return []
         try:
-            users = json.loads(self.path.read_text(encoding="utf-8"))["users"]
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            users = data["users"]
             if not isinstance(users, list) or not all(
                     isinstance(u, dict) and isinstance(u["id"], str) and isinstance(u["username"], str)
                     for u in users):
                 raise ValueError
-            return users
         except (OSError, ValueError, KeyError, TypeError):
             raise AuthFileError(
                 f"Файл {self.path.name} пошкоджено або недоступний.\n"
                 "Відновіть його з резервної копії або перемістіть вручну, щоб створити нових користувачів.")
+        mac = data.get("mac")
+        if mac is None and not required:
+            self._migrate = True              # файл старого формату: підписується при першому збереженні
+            return users
+        try:
+            if not isinstance(mac, dict):
+                raise IntegrityError("Підпис відсутній.")
+            if not isinstance(mac.get("kid"), str):
+                raise IntegrityError("Підпис пошкоджено.")
+            body = {k: v for k, v in data.items() if k != "mac"}
+            mac_check(mac_key(self.km.device.get(mac["kid"])), body, mac.get("tag"))
+        except CryptoError as e:
+            raise AuthFileError(f"Порушено цілісність {self.path.name} ({e})\n"
+                                "Файл змінено поза застосунком або пошкоджено. Відновіть його з резервної копії.")
+        return users
 
     def _save(self):
-        write_json_atomic(self.path, {"version": 1, "users": self.users})
+        """Запис users.json з HMAC-SHA256 (ключ — похідний від ключа пристрою)."""
+        self.km.device.set_mac_required()      # спершу фіксуємо вимогу підпису, потім пишемо файл
+        kid = self.km.device.current_kid()
+        body = {"version": 2, "users": self.users}
+        body["mac"] = {"alg": "HMAC-SHA256", "kid": kid, "tag": mac_tag(mac_key(self.km.device.get(kid)), body)}
+        write_json_atomic(self.path, body)
+
+    # -- версія даних задач (захист від відкату й підміни tasks.json)
+    def get_seq(self, uid):
+        user = next((u for u in self.users if u["id"] == uid), None)
+        return user.get("data_seq") if user else None
+
+    def set_seq(self, uid, seq):
+        user = next((u for u in self.users if u["id"] == uid), None)
+        if user is not None and user.get("data_seq") != seq:
+            user["data_seq"] = seq
+            self._save()
 
     # -- допоміжні
     def usernames(self):
@@ -806,7 +850,33 @@ def rotate_dek(auth, vault, session, tasks):
     auth.finish_dek_rotation(session)
 
 
+def accept_tasks_state(auth, vault):
+    """Свідоме прийняття поточного стану tasks.json (після відкату/втрати файлу)."""
+    for u in auth.users:
+        bucket = vault.buckets.get(u["id"])
+        u["data_seq"] = bucket.get("seq", 0) if bucket else 0
+    auth._save()
+
+
 def main():
+    if "--verify" in sys.argv:                   # перевірка цілісності програми без запуску
+        try:
+            status, fp = verify_release(APP_DIR)
+        except ReleaseError as e:
+            print(f"ПОМИЛКА: {e}")
+            return 2
+        print("Програму не підписано." if status == "unsigned" else f"Підпис і хеші файлів вірні. Відбиток ключа: {fp}")
+        return 0
+    if "--accept-tasks-state" in sys.argv:
+        if input("Це вимкне виявлення відкату tasks.json. Введіть YES: ") != "YES":
+            return 1
+        try:
+            accept_tasks_state(AuthService(USERS_FILE, DEVICE_KEY_FILE), TaskVault(DATA_FILE))
+        except (AuthFileError, VaultError) as e:
+            print(f"Помилка: {e}")
+            return 1
+        print("Готово.")
+        return 0
     if "--rotate-device-key" in sys.argv:        # ротація ключа пристрою без GUI
         try:
             AuthService(USERS_FILE, DEVICE_KEY_FILE).rotate_device_key()
@@ -816,9 +886,21 @@ def main():
         print("Ключ пристрою замінено.")
         return 0
     root = tk.Tk()
+    try:                                         # цілісність і автентичність програми — до відкриття даних
+        status, _fp = verify_release(APP_DIR)
+    except ReleaseError as e:
+        root.withdraw()
+        messagebox.showerror("Порушено цілісність програми",
+                             f"{e}\nЗапуск зупинено. Перевстановіть програму з довіреного джерела.")
+        root.destroy()
+        return 2
+    if status == "unsigned" and not messagebox.askyesno(
+            "Цілісність програми не перевірено", "Підпису випуску не знайдено. Продовжити без перевірки?"):
+        root.destroy()
+        return 1
     try:
         auth = AuthService(USERS_FILE, DEVICE_KEY_FILE)
-        vault = TaskVault(DATA_FILE)
+        vault = TaskVault(DATA_FILE, seq_store=auth)
     except (AuthFileError, VaultError) as e:
         root.withdraw()
         messagebox.showerror("Помилка", str(e))

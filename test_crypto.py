@@ -34,7 +34,7 @@ class Base(unittest.TestCase):
         self.dir = Path(tempfile.mkdtemp())
         self.users, self.tasks_file, self.devkey = self.dir / "users.json", self.dir / "tasks.json", self.dir / "device.key"
         self.auth = main.AuthService(self.users, self.devkey)
-        self.vault = TaskVault(self.tasks_file)
+        self.vault = TaskVault(self.tasks_file, seq_store=self.auth)
         self.alice = self.auth.register("Alice", ""); self.alice.end()      # без пароля -> ключ пристрою
         self.bob = self.auth.register("Bob", PW); self.bob.end()            # з паролем -> ключ із пароля
         self.alice = self.auth.login("Alice")
@@ -56,8 +56,8 @@ class Base(unittest.TestCase):
         return self.tasks_file.read_bytes()
 
     def reload(self):
-        self.vault = TaskVault(self.tasks_file)
         self.auth = main.AuthService(self.users, self.devkey)
+        self.vault = TaskVault(self.tasks_file, seq_store=self.auth)
 
 
 class Encryption(Base):
@@ -216,11 +216,10 @@ class KeyProtection(Base):
     def test_missing_device_key_is_not_silently_recreated(self):
         """AT-37. Втрата device.key не призводить до тихого створення нового ключа"""
         self.devkey.unlink()
-        self.reload()
-        with self.assertRaises(main.AuthError) as cm:
-            self.auth.login("Alice")
+        with self.assertRaises(main.AuthFileError) as cm:
+            self.reload()
         self.assertFalse(self.devkey.exists())
-        self.ok(f"Вхід відхилено: {cm.exception}")
+        self.ok(f"Запуск відхилено, нового ключа не створено: {str(cm.exception).splitlines()[0]}")
 
 
 class Rotation(Base):
@@ -311,10 +310,9 @@ class Migration(Base):
 
     def test_legacy_profile_gets_keys_on_login(self):
         """AT-39. Профіль зі старого users.json (без ключів) отримує ключі при першому вході"""
-        data = json.loads(self.users.read_text(encoding="utf-8"))
-        for u in data["users"]:
+        for u in self.auth.users:                       # імітуємо профілі до версії 1.3
             u.pop("crypto")
-        self.users.write_text(json.dumps(data), encoding="utf-8")
+        self.auth._save()
         self.reload()
         self.assertIsNone(self.auth.find("Alice").get("crypto"))
         a = self.auth.login("Alice"); b = self.auth.login("Bob", PW)

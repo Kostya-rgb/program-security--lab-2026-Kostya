@@ -7,10 +7,13 @@ import base64
 import hashlib
 import json
 import os
+import hmac
 import secrets
 from datetime import datetime, timedelta
 
 from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 ALG = "AES-256-GCM"
@@ -24,6 +27,10 @@ TS_FMT = "%Y-%m-%dT%H:%M:%S"
 
 class CryptoError(Exception):
     """Ключ недоступний, дані пошкоджені або підроблені."""
+
+
+class IntegrityError(CryptoError):
+    """Порушено цілісність або автентичність (MAC не збігається)."""
 
 
 # ---------------------------------------------------------------- примітиви
@@ -49,6 +56,26 @@ def open_sealed(key, blob, aad):
         raise CryptoError("Дані пошкоджено, змінено або ключ невірний.")
 
 
+def _canonical(obj):
+    return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def mac_key(device_key):
+    """Окремий ключ HMAC із ключа пристрою (розділення доменів через HKDF)."""
+    return HKDF(algorithm=hashes.SHA256(), length=KEY_LEN, salt=None,
+                info=b"planuvalnyk|users-mac|v1").derive(device_key)
+
+
+def mac_tag(key, obj):
+    return hmac.new(key, _canonical(obj), "sha256").hexdigest()
+
+
+def mac_check(key, obj, tag):
+    """Порівняння за сталий час."""
+    if not isinstance(tag, str) or not hmac.compare_digest(mac_tag(key, obj), tag):
+        raise IntegrityError("Порушено цілісність або автентичність файлу.")
+
+
 def write_private(path, data: bytes):
     """Атомарний запис; тимчасовий файл одразу створюється з правами 0600 (де ОС це підтримує)."""
     tmp = path.with_name(path.name + ".tmp")
@@ -71,6 +98,7 @@ class DeviceKey:
         self.path = path
         self._keys = None
         self.current = None
+        self._mac_required = False       # після першого підписаного users.json знімати підпис не можна
 
     def _load(self, create):
         if self._keys is not None:
@@ -82,6 +110,7 @@ class DeviceKey:
                 if data["current"] not in keys or any(len(v) != KEY_LEN for v in keys.values()):
                     raise ValueError
                 self._keys, self.current = keys, data["current"]
+                self._mac_required = bool(data.get("users_mac", False))
             except (OSError, ValueError, KeyError, TypeError, AttributeError):
                 raise CryptoError(f"Файл {self.path.name} пошкоджено.")
         elif create:
@@ -92,7 +121,25 @@ class DeviceKey:
 
     def _store(self):
         write_json_private(self.path, {"version": 1, "alg": ALG, "current": self.current,
+                                       "users_mac": self._mac_required,
                                        "keys": {k: _b64e(v) for k, v in self._keys.items()}})
+
+    def mac_required(self):
+        """Чи вимагається підпис users.json (не створює файл ключів)."""
+        if not self.path.exists():
+            return False
+        self._load(create=False)
+        return self._mac_required
+
+    def set_mac_required(self):
+        self._load(create=True)
+        if not self._mac_required:
+            self._mac_required = True
+            self._store()
+
+    def current_kid(self):
+        self.get()
+        return self.current
 
     def get(self, kid=None):
         """kid=None — поточний ключ (створюється, якщо файлу ще немає)."""
@@ -245,8 +292,9 @@ class TaskVault:
 
     VERSION = 2
 
-    def __init__(self, path):
+    def __init__(self, path, seq_store=None):
         self.path = path
+        self.seq_store = seq_store   # зберігає останній номер версії даних профілю (users.json, під HMAC)
         self.buckets = {}
         self.pending = []        # відкриті задачі старого формату: шифруються при вході власника
         self._read()
@@ -269,8 +317,10 @@ class TaskVault:
                              "Відновіть його з резервної копії або перемістіть вручну.")
 
     @staticmethod
-    def _aad(uid, ver):
-        return f"tasks|v2|{uid}|{ver}".encode()
+    def _aad(uid, ver, seq=None):
+        if seq is None:                          # формат без номера версії (1.3)
+            return f"tasks|v2|{uid}|{ver}".encode()
+        return f"tasks|v3|{uid}|{ver}|{seq}".encode()
 
     def _flush(self):
         out = {"version": self.VERSION, "alg": ALG, "buckets": self.buckets}
@@ -283,14 +333,27 @@ class TaskVault:
         (та без власника, якщо adopt_orphans) шифруються й зникають із відкритого вигляду."""
         tasks = []
         bucket = self.buckets.get(uid)
-        if bucket is not None:
+        expected = self.seq_store.get_seq(uid) if self.seq_store else None
+        if bucket is None:
+            if expected:
+                raise VaultError("Задачі профілю зникли з tasks.json, хоча раніше були збережені "
+                                 "(файл видалено або замінено).\nВідновіть tasks.json і users.json з однієї копії.")
+        else:
             try:
-                ver = bucket["kver"]
-                tasks = json.loads(open_sealed(keys.get(ver), bucket, self._aad(uid, ver)).decode("utf-8"))
-                if not isinstance(tasks, list):
+                ver, seq = bucket["kver"], bucket.get("seq")
+                tasks = json.loads(open_sealed(keys.get(ver), bucket, self._aad(uid, ver, seq)).decode("utf-8"))
+                if not isinstance(tasks, list) or not (seq is None or isinstance(seq, int)):
                     raise ValueError
             except (CryptoError, KeyError, ValueError, TypeError):
                 raise VaultError("Не вдалося розшифрувати задачі: файл пошкоджено, змінено або ключ невірний.")
+            actual = seq or 0
+            if expected is None or expected == actual:
+                pass
+            elif actual == expected + 1:               # збій між записом tasks.json і users.json: лікуємо
+                self.seq_store.set_seq(uid, actual)
+            else:
+                raise VaultError("Версія задач не відповідає записаній: схоже на відкат tasks.json до старішої "
+                                 "копії або підміну одного з файлів.\nВідновіть tasks.json і users.json з однієї копії.")
         mine = [t for t in self.pending
                 if t.get("owner") == uid or (adopt_orphans and t.get("owner") is None)]
         if mine:
@@ -301,6 +364,11 @@ class TaskVault:
 
     def save_user(self, uid, keys, tasks):
         ver = keys.cur
+        known = max((self.buckets.get(uid) or {}).get("seq", 0),
+                    (self.seq_store.get_seq(uid) or 0) if self.seq_store else 0)
+        seq = known + 1
         plain = json.dumps(tasks, ensure_ascii=False).encode("utf-8")
-        self.buckets[uid] = {"kver": ver, **seal(keys.get(ver), plain, self._aad(uid, ver))}
+        self.buckets[uid] = {"kver": ver, "seq": seq, **seal(keys.get(ver), plain, self._aad(uid, ver, seq))}
         self._flush()
+        if self.seq_store:
+            self.seq_store.set_seq(uid, seq)
