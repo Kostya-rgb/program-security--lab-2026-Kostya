@@ -8,13 +8,16 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 from pathlib import Path
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 MANIFEST, SIGNATURE, PUBLIC_KEY = "MANIFEST.json", "MANIFEST.sig", "release_public.key"
-PROTECTED = ["main.py", "access_control.py", "crypto_store.py", "integrity.py", "requirements.txt"]
+PROTECTED = ["main.py", "access_control.py", "crypto_store.py", "integrity.py", "licensing.py", "updater.py",
+             "version.py", "requirements.txt"]
+OPTIONAL = ["license_public.key"]         # входить до маніфесту, якщо існує
 
 
 class IntegrityError(Exception):
@@ -25,9 +28,20 @@ def sha256_file(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def build_manifest(app_dir, files=PROTECTED):
-    """Канонічний (детермінований) JSON-маніфест."""
-    manifest = {"version": 1, "alg": "SHA-256", "files": {n: sha256_file(Path(app_dir) / n) for n in files}}
+def read_version(app_dir):
+    """Версія з version.py (текстом, без виконання коду)."""
+    m = re.search(r'^APP_VERSION\s*=\s*"(\d+(?:\.\d+)*)"', (Path(app_dir) / "version.py").read_text(encoding="utf-8"), re.M)
+    if not m:
+        raise IntegrityError("У version.py немає APP_VERSION.")
+    return m.group(1)
+
+
+def build_manifest(app_dir):
+    """Канонічний (детермінований) JSON-маніфест: версія, продукт, SHA-256 файлів."""
+    d = Path(app_dir)
+    names = PROTECTED + [n for n in OPTIONAL if (d / n).exists()]
+    manifest = {"format": 1, "product": "planuvalnyk", "app_version": read_version(d), "alg": "SHA-256",
+                "files": {n: sha256_file(d / n) for n in names}}
     return json.dumps(manifest, sort_keys=True, indent=2).encode("utf-8")
 
 

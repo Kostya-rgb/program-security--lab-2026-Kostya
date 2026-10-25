@@ -7,7 +7,7 @@ import secrets
 import sys
 import time
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import filedialog, messagebox, ttk
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -15,6 +15,9 @@ from access_control import AccessDenied, Session, authorize, is_allowed
 from crypto_store import (CryptoError, IntegrityError, KeyManager, TaskVault, VaultError,
                           mac_check, mac_key, mac_tag, write_json_private)
 from integrity import IntegrityError as ReleaseError, verify_release
+from licensing import FREE, LicenseError, LicenseLimit, LicenseManager
+from updater import UpdateError, apply_update
+from version import APP_VERSION
 
 DATA_FILE = Path(__file__).with_name("tasks.json")
 USERS_FILE = Path(__file__).with_name("users.json")
@@ -55,8 +58,9 @@ class TaskService:
     перед виконанням; назовні віддаються лише копії, тож змінити дані в обхід
     операцій неможливо. Поле owner задає лише сервіс (із сеансу), а не введення."""
 
-    def __init__(self, tasks, save=None):
+    def __init__(self, tasks, save=None, entitlements=None):
         self._tasks = tasks
+        self._entitlements = entitlements or (lambda: FREE)
         self._save = save or (lambda tasks: None)   # save: шифрує й записує задачі профілю
 
     @staticmethod
@@ -91,6 +95,10 @@ class TaskService:
 
     def create(self, session, data):
         authorize(session, "task:create")
+        limit = self._entitlements().max_tasks              # обмеження редакції перевіряється перед операцією
+        if limit is not None and sum(1 for t in self._tasks if is_allowed(session, "task:read", t)) >= limit:
+            raise LicenseLimit(f"Редакція Free дозволяє до {limit} задач на профіль. "
+                               "Видаліть непотрібні задачі або активуйте ліцензію Pro.")
         task = self._clean(data)
         task.update(id=max((t.get("id", 0) for t in self._tasks if isinstance(t, dict)), default=0) + 1,
                     owner=session.user_id, done=False, reminded=False)
@@ -145,8 +153,9 @@ class AuthFileError(Exception):
 class AuthService:
     """Користувачі: ідентифікація за іменем, необов'язковий пароль (scrypt + сіль)."""
 
-    def __init__(self, path, device_key_path=None):
+    def __init__(self, path, device_key_path=None, entitlements=None):
         self.path = path
+        self._entitlements = entitlements or (lambda: FREE)
         self.km = KeyManager(device_key_path or path.with_name("device.key"))
         self._migrate = False
         self.users = self._load()
@@ -264,6 +273,9 @@ class AuthService:
     # -- сценарії
     def register(self, username, password="", session=None):
         authorize(session, "profile:register")
+        limit = self._entitlements().max_profiles           # обмеження редакції перевіряється перед операцією
+        if limit is not None and len(self.users) >= limit:
+            raise AuthError(f"Редакція Free дозволяє до {limit} профілів. Для більшої кількості потрібна ліцензія Pro.")
         username = (username or "").strip()
         if not USERNAME_RE.fullmatch(username):
             raise AuthError("Ім'я: 3–32 символи — літери, цифри, «_», «-», «.».")
@@ -501,11 +513,57 @@ class PasswordDialog(tk.Toplevel):
         self.destroy()
 
 
+class LicenseDialog(tk.Toplevel):
+    """Код пристрою для замовлення ліцензії та офлайн-активація файлу license.lic."""
+
+    def __init__(self, parent, lic):
+        super().__init__(parent)
+        self.lic = lic
+        self.title("Ліцензія")
+        self.resizable(False, False)
+        self.transient(parent)
+        frm = ttk.Frame(self, padding=15)
+        frm.pack()
+        ttk.Label(frm, text=lic.summary()).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        _ent, err, _payload = lic.status()
+        if err:
+            ttk.Label(frm, text=err, foreground="#b00020", wraplength=380).grid(row=1, column=0, columnspan=2, sticky="w")
+        ttk.Label(frm, text="Код пристрою (надішліть видавцю для отримання ліцензії):").grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(8, 2))
+        self.code_var = tk.StringVar(value=lic.device)
+        ttk.Entry(frm, textvariable=self.code_var, state="readonly", width=34).grid(row=3, column=0, sticky="w")
+        ttk.Button(frm, text="Копіювати", command=self._copy).grid(row=3, column=1, padx=(8, 0))
+        btns = ttk.Frame(frm)
+        btns.grid(row=4, column=0, columnspan=2, pady=(12, 0))
+        ttk.Button(btns, text="Активувати файл ліцензії…", command=self._activate).pack(side="left", padx=5)
+        ttk.Button(btns, text="Закрити", command=self.destroy).pack(side="left", padx=5)
+        self.grab_set()
+        self.wait_window()
+
+    def _copy(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.code_var.get())
+
+    def _activate(self):
+        path = filedialog.askopenfilename(parent=self, title="Файл ліцензії", filetypes=[("Ліцензія", "*.lic"), ("Усі", "*")])
+        if not path:
+            return
+        try:
+            ent, payload = self.lic.activate(path)
+        except LicenseError as e:
+            messagebox.showerror("Ліцензія", str(e), parent=self)
+            return
+        messagebox.showinfo("Ліцензія", f"Активовано: {ent.summary()}", parent=self)
+        self.destroy()
+
+
 # ---------------------------------------------------------------- додаток
 class TodoApp:
-    def __init__(self, root, auth, vault):
+    def __init__(self, root, auth, vault, lic):
         self.root = root
         self.auth = auth
+        self.lic = lic
+        self.edition_var = tk.StringVar()
         self.root.title("Планувальник справ")
 
         self.vault = vault
@@ -573,7 +631,8 @@ class TodoApp:
             messagebox.showerror("Помилка", str(e))
             self.show_login()
             return
-        self.service = TaskService(tasks, save=lambda t: self.vault.save_user(session.user_id, session.keys, t))
+        self.service = TaskService(tasks, save=lambda t: self.vault.save_user(session.user_id, session.keys, t),
+                                   entitlements=self.lic.entitlements)
         # задачі з версії без користувачів дістаються першому створеному користувачу
         self.service.claim_legacy(session, self.auth.first_user_id())
         self._rotate_dek_if_due(session, tasks)
@@ -604,6 +663,11 @@ class TodoApp:
         PasswordDialog(self.root, self.auth, self.session)
         self._touch()
 
+    def show_license(self):
+        LicenseDialog(self.root, self.lic)
+        self.edition_var.set(self.lic.summary())
+        self._touch()
+
     def quit(self):
         self._end_session()
         self.root.destroy()
@@ -615,6 +679,9 @@ class TodoApp:
         ttk.Label(top, text=f"Користувач: {self.session.username}").pack(side="left")
         ttk.Button(top, text="Вийти", command=self.show_login).pack(side="right")
         ttk.Button(top, text="Пароль…", command=self.change_password).pack(side="right", padx=5)
+        ttk.Button(top, text="Ліцензія…", command=self.show_license).pack(side="right")
+        self.edition_var.set(self.lic.summary())
+        ttk.Label(top, textvariable=self.edition_var, foreground="#666666").pack(side="left", padx=15)
 
         form = ttk.LabelFrame(self.root, text="Завдання")
         form.pack(fill="x", padx=10, pady=(10, 5))
@@ -858,7 +925,39 @@ def accept_tasks_state(auth, vault):
     auth._save()
 
 
+def _arg(flag):
+    """Значення після прапорця командного рядка або None."""
+    i = sys.argv.index(flag)
+    return sys.argv[i + 1] if i + 1 < len(sys.argv) else None
+
+
 def main():
+    lic = LicenseManager(APP_DIR)
+    if "--device-id" in sys.argv:                # код пристрою для замовлення ліцензії
+        print(lic.device)
+        return 0
+    if "--license" in sys.argv:
+        ent, err, _ = lic.status()
+        print(lic.summary() + (f"\nУвага: {err}" if err else ""))
+        return 0
+    if "--activate" in sys.argv:
+        try:
+            ent, _ = lic.activate(_arg("--activate") or "")
+        except LicenseError as e:
+            print(f"Ліцензію не прийнято: {e}")
+            return 1
+        print(f"Активовано: {ent.summary()}")
+        return 0
+    if "--update" in sys.argv:
+        try:
+            print(f"Оновлено до версії {apply_update(_arg('--update') or '', APP_DIR)}. Перезапустіть програму.")
+        except UpdateError as e:
+            print(f"Оновлення відхилено: {e}")
+            return 1
+        return 0
+    if "--version" in sys.argv:
+        print(APP_VERSION)
+        return 0
     if "--verify" in sys.argv:                   # перевірка цілісності програми без запуску
         try:
             status, fp = verify_release(APP_DIR)
@@ -898,15 +997,18 @@ def main():
             "Цілісність програми не перевірено", "Підпису випуску не знайдено. Продовжити без перевірки?"):
         root.destroy()
         return 1
+    _ent, license_error, _p = lic.status()
+    if license_error:
+        messagebox.showwarning("Ліцензія", f"{license_error}\nПрацює редакція Free.")
     try:
-        auth = AuthService(USERS_FILE, DEVICE_KEY_FILE)
+        auth = AuthService(USERS_FILE, DEVICE_KEY_FILE, entitlements=lic.entitlements)
         vault = TaskVault(DATA_FILE, seq_store=auth)
     except (AuthFileError, VaultError) as e:
         root.withdraw()
         messagebox.showerror("Помилка", str(e))
         root.destroy()
         return 1
-    TodoApp(root, auth, vault)
+    TodoApp(root, auth, vault, lic)
     root.mainloop()
     return 0
 
