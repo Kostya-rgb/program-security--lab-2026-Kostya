@@ -11,7 +11,13 @@ from tkinter import filedialog, messagebox, ttk
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import access_control
+import crypto_store
+import integrity
+import licensing
+import updater
 from access_control import AccessDenied, Session, authorize, is_allowed
+from anti_tamper import Guard, TamperError
 from crypto_store import (CryptoError, IntegrityError, KeyManager, TaskVault, VaultError,
                           mac_check, mac_key, mac_tag, write_json_private)
 from integrity import IntegrityError as ReleaseError, verify_release
@@ -94,6 +100,7 @@ class TaskService:
         return dict(self._get(session, task_id, "task:read"))
 
     def create(self, session, data):
+        GUARD.check()                    # обхід перевірки редакції через патч функції виявляється тут
         authorize(session, "task:create")
         limit = self._entitlements().max_tasks              # обмеження редакції перевіряється перед операцією
         if limit is not None and sum(1 for t in self._tasks if is_allowed(session, "task:read", t)) >= limit:
@@ -272,6 +279,7 @@ class AuthService:
 
     # -- сценарії
     def register(self, username, password="", session=None):
+        GUARD.check()                    # обхід ліміту профілів через патч функції виявляється тут
         authorize(session, "profile:register")
         limit = self._entitlements().max_profiles           # обмеження редакції перевіряється перед операцією
         if limit is not None and len(self.users) >= limit:
@@ -513,6 +521,20 @@ class PasswordDialog(tk.Toplevel):
         self.destroy()
 
 
+GUARD = (Guard()
+         .watch(TaskService, "create")
+         .watch(AuthService, "register")
+         .watch(licensing, "verify_license")
+         .watch(licensing.LicenseManager, "status")
+         .watch(licensing.LicenseManager, "activate")
+         .watch(access_control, "authorize")
+         .watch(access_control, "is_allowed")
+         .watch(crypto_store, "mac_check")
+         .watch(integrity, "verify_release")
+         .watch(updater, "verify_update"))
+# Відбитки знято одразу після визначення цих функцій (до взаємодії користувача) — див. zakhyst_vid_reversu.md.
+
+
 class LicenseDialog(tk.Toplevel):
     """Код пристрою для замовлення ліцензії та офлайн-активація файлу license.lic."""
 
@@ -549,7 +571,13 @@ class LicenseDialog(tk.Toplevel):
         if not path:
             return
         try:
+            GUARD.check()
             ent, payload = self.lic.activate(path)
+        except TamperError as e:
+            messagebox.showerror("Цілісність програми", str(e), parent=self)
+            self.destroy()
+            self.master.destroy()
+            return
         except LicenseError as e:
             messagebox.showerror("Ліцензія", str(e), parent=self)
             return
@@ -614,6 +642,10 @@ class TodoApp:
         except AccessDenied as e:
             self._denied(e)
             return False, None
+        except TamperError as e:
+            messagebox.showerror("Цілісність програми", f"{e}\nПрограму буде закрито.")
+            self.root.destroy()
+            return False, None
 
     def show_login(self, notice=""):
         self._end_session()
@@ -664,6 +696,12 @@ class TodoApp:
         self._touch()
 
     def show_license(self):
+        try:
+            GUARD.check()
+        except TamperError as e:
+            messagebox.showerror("Цілісність програми", f"{e}\nПрограму буде закрито.")
+            self.root.destroy()
+            return
         LicenseDialog(self.root, self.lic)
         self.edition_var.set(self.lic.summary())
         self._touch()
@@ -878,6 +916,12 @@ class TodoApp:
 
     # ------------------------------------------------------------ нагадування
     def check_reminders(self):
+        try:
+            GUARD.check()
+        except TamperError as e:
+            messagebox.showerror("Цілісність програми", f"{e}\nПрограму буде закрито.")
+            self.root.destroy()
+            return
         if self.session is None:
             return
         if not self.session.active:
@@ -932,16 +976,26 @@ def _arg(flag):
 
 
 def main():
+    try:
+        return _main()
+    except TamperError as e:
+        print(f"Помилка: {e}")
+        return 3
+
+
+def _main():
     lic = LicenseManager(APP_DIR)
     if "--device-id" in sys.argv:                # код пристрою для замовлення ліцензії
         print(lic.device)
         return 0
     if "--license" in sys.argv:
+        GUARD.check()
         ent, err, _ = lic.status()
         print(lic.summary() + (f"\nУвага: {err}" if err else ""))
         return 0
     if "--activate" in sys.argv:
         try:
+            GUARD.check()
             ent, _ = lic.activate(_arg("--activate") or "")
         except LicenseError as e:
             print(f"Ліцензію не прийнято: {e}")
@@ -950,10 +1004,14 @@ def main():
         return 0
     if "--update" in sys.argv:
         try:
+            GUARD.check()
             print(f"Оновлено до версії {apply_update(_arg('--update') or '', APP_DIR)}. Перезапустіть програму.")
         except UpdateError as e:
             print(f"Оновлення відхилено: {e}")
             return 1
+        except TamperError as e:
+            print(f"Помилка: {e}")
+            return 3
         return 0
     if "--version" in sys.argv:
         print(APP_VERSION)

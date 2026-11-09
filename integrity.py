@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 MANIFEST, SIGNATURE, PUBLIC_KEY = "MANIFEST.json", "MANIFEST.sig", "release_public.key"
 PROTECTED = ["main.py", "access_control.py", "crypto_store.py", "integrity.py", "licensing.py", "updater.py",
-             "version.py", "requirements.txt"]
+             "version.py", "anti_tamper.py", "requirements.txt"]
 OPTIONAL = ["license_public.key"]         # входить до маніфесту, якщо існує
 
 

@@ -45,9 +45,15 @@ class Entitlements:
         return f"Редакція {self.edition}: до {self.max_profiles} профілів, до {self.max_tasks} задач на профіль"
 
 
+def _token(value):
+    """Непряме порівняння замість рядкового літералу: магічне значення, що відкриває Pro,
+    не лежить у коді явним текстом (ускладнює пошук підрядком). Див. zakhyst_vid_reversu.md."""
+    return hashlib.sha256(f"planuvalnyk|edition|{value}".encode("utf-8")).hexdigest()[:16]
+
+
 FREE = Entitlements("Free", 3, 30)
 PRO = Entitlements("Pro", None, None)
-EDITIONS = {"pro": PRO}
+EDITIONS = {_token("pro"): PRO}
 
 
 # ---------------------------------------------------------------- код пристрою
@@ -83,30 +89,72 @@ def canonical(payload):
     return json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-def verify_license(license_path, public_path, device, app_version=APP_VERSION):
-    """Повертає (Entitlements, payload) або LicenseError."""
+# Перевірка ліцензії виконується як перехід між непослідовно пронумерованими станами
+# (а не прямим ланцюжком if/elif): читання коду не дає одразу побачити порядок і повний
+# перелік умов проходження. Сам Python легко простежити виконанням (dis, трасування), тож
+# це ускладнює лише СТАТИЧНЕ читання, а не динамічний аналіз — див. zakhyst_vid_reversu.md.
+_V_LOAD, _V_SIG, _V_PRODUCT, _V_EDITION, _V_DEVICE, _V_VERSION, _V_DONE = 71, 34, 58, 12, 90, 23, -1
+
+
+def _step_load(ctx):
     try:
-        doc = json.loads(Path(license_path).read_text(encoding="utf-8"))
-        payload = doc["payload"]
-        signature = base64.b64decode(doc["sig"], validate=True)
-        public = Ed25519PublicKey.from_public_bytes(
-            base64.b64decode(Path(public_path).read_text(encoding="ascii").strip(), validate=True))
-        public.verify(signature, canonical(payload))
-    except InvalidSignature:
-        raise LicenseError("Підпис ліцензії недійсний: файл змінено або видано не нашим ключем.")
+        doc = json.loads(Path(ctx["license_path"]).read_text(encoding="utf-8"))
+        ctx["payload"] = doc["payload"]
+        ctx["_sig"] = base64.b64decode(doc["sig"], validate=True)
+        ctx["_pub"] = Ed25519PublicKey.from_public_bytes(
+            base64.b64decode(Path(ctx["public_path"]).read_text(encoding="ascii").strip(), validate=True))
     except (OSError, ValueError, KeyError, TypeError):
         raise LicenseError("Файл ліцензії або ключа пошкоджено.")
+    return _V_SIG
+
+
+def _step_sig(ctx):
+    try:
+        ctx["_pub"].verify(ctx["_sig"], canonical(ctx["payload"]))
+    except InvalidSignature:
+        raise LicenseError("Підпис ліцензії недійсний: файл змінено або видано не нашим ключем.")
+    return _V_PRODUCT
+
+
+def _step_product(ctx):
+    payload = ctx["payload"]
     if not isinstance(payload, dict) or payload.get("product") != PRODUCT:
         raise LicenseError("Ліцензія видана для іншого продукту.")
-    edition = EDITIONS.get(payload.get("edition"))
+    return _V_EDITION
+
+
+def _step_edition(ctx):
+    edition = EDITIONS.get(_token(ctx["payload"].get("edition")))
     if edition is None:
         raise LicenseError("Невідома редакція в ліцензії.")
-    if not hmac.compare_digest(str(payload.get("device", "")).lower(), str(device).lower()):
+    ctx["edition"] = edition
+    return _V_DEVICE
+
+
+def _step_device(ctx):
+    if not hmac.compare_digest(str(ctx["payload"].get("device", "")).lower(), str(ctx["device"]).lower()):
         raise LicenseError("Ліцензію видано для іншого пристрою.")
-    lic_major = payload.get("major")
-    if not isinstance(lic_major, int) or lic_major < major(app_version):
+    return _V_VERSION
+
+
+def _step_version(ctx):
+    lic_major = ctx["payload"].get("major")
+    if not isinstance(lic_major, int) or lic_major < major(ctx["app_version"]):
         raise LicenseError("Ліцензія не поширюється на цю версію програми.")
-    return edition, payload
+    return _V_DONE
+
+
+_STEPS = {_V_LOAD: _step_load, _V_SIG: _step_sig, _V_PRODUCT: _step_product,
+          _V_EDITION: _step_edition, _V_DEVICE: _step_device, _V_VERSION: _step_version}
+
+
+def verify_license(license_path, public_path, device, app_version=APP_VERSION):
+    """Повертає (Entitlements, payload) або LicenseError."""
+    ctx = {"license_path": license_path, "public_path": public_path, "device": device, "app_version": app_version}
+    state = _V_LOAD
+    while state != _V_DONE:
+        state = _STEPS[state](ctx)
+    return ctx["edition"], ctx["payload"]
 
 
 class LicenseManager:
